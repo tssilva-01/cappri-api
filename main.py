@@ -121,6 +121,23 @@ def listar_premios():
     return {"status": "sucesso", "dados": resposta.data}
 
 
+@app.get("/verificar-token/{token}")
+def verificar_token(token: str, request: Request):
+    # Só CONFERE se o link é válido — não marca como usado, não sorteia
+    # nada. Serve pra avisar a cliente logo no início (antes de pedir
+    # pra ela compartilhar 3 vezes) se o link dela não vai funcionar.
+    verificar_limite_de_tentativas(request)
+
+    acesso = supabase.table("acessos_roleta").select("*").eq("token", token).execute()
+    if len(acesso.data) == 0:
+        return {"valido": False, "mensagem": "Token não existe!"}
+
+    if acesso.data[0]["utilizado"]:
+        return {"valido": False, "mensagem": "Esse link já foi utilizado!"}
+
+    return {"valido": True}
+
+
 @app.post("/sortear/{token}")
 def sortear_premio(token: str, dados: ParticipanteInput, request: Request):
     verificar_limite_de_tentativas(request)
