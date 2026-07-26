@@ -1,75 +1,231 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client, Client
+import os
+import re
 import random
+from collections import defaultdict
+from time import time
 
-# 1. Configurando a conexão com o banco de dados
-url: str = "https://ahbfzljivifqxzwcynbe.supabase.co"
-key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFoYmZ6bGppdmlmcXh6d2N5bmJlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM4NjkyNjMsImV4cCI6MjA5OTQ0NTI2M30.Ya71-XTbnRJL18jgJ7fyap0fRC0ijpYj9oAOyE2rFts"
-supabase: Client = create_client(url, key)
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
+from supabase import create_client, Client
+
+# =========================================================
+# 1. CONEXÃO COM O BANCO DE DADOS (via variáveis de ambiente)
+# =========================================================
+# IMPORTANTE: a URL e a CHAVE do Supabase não ficam mais escritas
+# aqui no código. Elas são lidas do ambiente do servidor (Render).
+# Veja o guia de implementação para saber como cadastrar essas
+# variáveis no painel do Render (SUPABASE_URL e SUPABASE_KEY).
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "As variáveis de ambiente SUPABASE_URL e SUPABASE_KEY não foram "
+        "encontradas. Configure-as no painel do Render antes de rodar a API."
+    )
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
 
-# --- BLOCO DE SEGURANÇA (CORS) ---
-# Isso permite que o seu site no Netlify converse com o Python no Render
+# =========================================================
+# 2. CORS — só o domínio oficial da loja pode chamar essa API
+# =========================================================
+# Se no futuro a loja passar a usar um domínio próprio
+# (ex: roleta.cappri.com.br), basta adicionar essa nova URL
+# nesta lista, mantendo a antiga se ainda estiver em uso.
+ORIGENS_PERMITIDAS = [
+    "https://capprimodafeminina.github.io",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ORIGENS_PERMITIDAS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# Rota de teste (só para listar)
+
+# =========================================================
+# 3. VALIDAÇÃO DOS DADOS QUE CHEGAM DO FORMULÁRIO
+# =========================================================
+class ParticipanteInput(BaseModel):
+    nome: str
+    whatsapp: str
+
+    @field_validator("nome")
+    @classmethod
+    def validar_nome(cls, valor: str) -> str:
+        valor = valor.strip()
+        if len(valor) < 2 or len(valor) > 100:
+            raise ValueError("Digite um nome válido.")
+        return valor
+
+    @field_validator("whatsapp")
+    @classmethod
+    def validar_whatsapp(cls, valor: str) -> str:
+        # Remove tudo que não for número (parênteses, espaço, traço, etc.)
+        somente_numeros = re.sub(r"\D", "", valor)
+        if not re.match(r"^\d{10,11}$", somente_numeros):
+            raise ValueError(
+                "WhatsApp inválido. Use o formato (DD) 9XXXX-XXXX, com DDD."
+            )
+        return somente_numeros
+
+
+# Transforma qualquer erro de validação (nome vazio, whatsapp errado, etc.)
+# numa resposta simples e única, sempre no campo "detail", para o
+# front-end não precisar tratar formatos diferentes de erro.
+@app.exception_handler(RequestValidationError)
+async def tratar_erro_de_validacao(request: Request, exc: RequestValidationError):
+    erros = exc.errors()
+    mensagem = erros[0]["msg"] if erros else "Dados inválidos."
+    mensagem = mensagem.replace("Value error, ", "")
+    return JSONResponse(status_code=422, content={"detail": mensagem})
+
+
+# =========================================================
+# 4. LIMITE DE TENTATIVAS (proteção simples contra abuso)
+# =========================================================
+# Guarda, na memória do servidor, os horários das últimas tentativas
+# de cada IP. Não é uma solução robusta de nível bancário, mas evita
+# que alguém fique tentando "adivinhar" tokens em sequência rápida.
+_tentativas_por_ip = defaultdict(list)
+JANELA_SEGUNDOS = 60
+LIMITE_TENTATIVAS = 5
+
+
+def verificar_limite_de_tentativas(request: Request):
+    ip = request.client.host if request.client else "desconhecido"
+    agora = time()
+    tentativas = _tentativas_por_ip[ip]
+    tentativas[:] = [t for t in tentativas if agora - t < JANELA_SEGUNDOS]
+    if len(tentativas) >= LIMITE_TENTATIVAS:
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas tentativas em pouco tempo. Aguarde um minuto e tente novamente.",
+        )
+    tentativas.append(agora)
+
+
+# =========================================================
+# ROTAS
+# =========================================================
 @app.get("/premios")
 def listar_premios():
     resposta = supabase.table("premios").select("*").execute()
     return {"status": "sucesso", "dados": resposta.data}
 
-# NOVA ROTA: O Sorteio Oficial com as Probabilidades
+
 @app.post("/sortear/{token}")
-def sortear_premio(token: str, nome_cliente: str, whatsapp_cliente: str):
-    
-    # 1. Verificar se o token é válido
+def sortear_premio(token: str, dados: ParticipanteInput, request: Request):
+    verificar_limite_de_tentativas(request)
+
+    # 1. Verificar se o token existe
     acesso = supabase.table("acessos_roleta").select("*").eq("token", token).execute()
-    
     if len(acesso.data) == 0:
-        return {"erro": "Token não existe!"}
-        
-    if acesso.data[0]['utilizado'] == True:
-        return {"erro": "Esse link já foi utilizado!"}
-        
-    acesso_id = acesso.data[0]['id']
+        raise HTTPException(status_code=404, detail="Token não existe!")
 
-    # 2. Pegar apenas prêmios que ainda têm estoque
-    premios_db = supabase.table("premios").select("*").gt("quantidade_estoque", 0).execute()
-    premios = premios_db.data
-    
-    if not premios:
-        return {"erro": "Acabaram os prêmios no estoque!"}
+    acesso_atual = acesso.data[0]
+    if acesso_atual["utilizado"]:
+        raise HTTPException(status_code=409, detail="Esse link já foi utilizado!")
 
-    # 3. A MÁGICA DA PROBABILIDADE: Sorteio Matemático baseado no peso
-    pesos = [float(p['probabilidade']) for p in premios]
-    premio_ganho = random.choices(premios, weights=pesos, k=1)[0]
-    premio_id = premio_ganho['id']
+    acesso_id = acesso_atual["id"]
+
+    # 2. RESERVAR o token de forma atômica.
+    # O ".eq('utilizado', False)" aqui é o que impede que duas
+    # pessoas usando o mesmo link ao mesmo tempo consigam sortear
+    # duas vezes: só uma das duas requisições vai conseguir
+    # atualizar essa linha, a outra recebe 0 resultados.
+    reserva = (
+        supabase.table("acessos_roleta")
+        .update({"utilizado": True})
+        .eq("id", acesso_id)
+        .eq("utilizado", False)
+        .execute()
+    )
+    if len(reserva.data) == 0:
+        raise HTTPException(status_code=409, detail="Esse link já foi utilizado!")
+
+    # 3. Sortear e descontar o estoque, com retentativas.
+    # A mesma lógica de "só atualiza se ainda estiver como eu vi"
+    # é usada aqui pro estoque, evitando que duas pessoas ganhem
+    # a última unidade de um prêmio ao mesmo tempo.
+    MAX_TENTATIVAS = 3
+    premio_ganho = None
+
+    for _ in range(MAX_TENTATIVAS):
+        premios_db = (
+            supabase.table("premios").select("*").gt("quantidade_estoque", 0).execute()
+        )
+        premios = premios_db.data
+
+        if not premios:
+            # Devolve o token pro cliente, já que ele não ganhou nada.
+            supabase.table("acessos_roleta").update({"utilizado": False}).eq(
+                "id", acesso_id
+            ).execute()
+            raise HTTPException(status_code=409, detail="Acabaram os prêmios no estoque!")
+
+        pesos = [float(p["probabilidade"]) for p in premios]
+        candidato = random.choices(premios, weights=pesos, k=1)[0]
+        estoque_lido = candidato["quantidade_estoque"]
+
+        atualizacao = (
+            supabase.table("premios")
+            .update({"quantidade_estoque": estoque_lido - 1})
+            .eq("id", candidato["id"])
+            .eq("quantidade_estoque", estoque_lido)
+            .execute()
+        )
+
+        if len(atualizacao.data) > 0:
+            premio_ganho = candidato
+            break
+
+    if premio_ganho is None:
+        # Perdeu a corrida pelo estoque nas 3 tentativas — devolve o token.
+        supabase.table("acessos_roleta").update({"utilizado": False}).eq(
+            "id", acesso_id
+        ).execute()
+        raise HTTPException(
+            status_code=409,
+            detail="Não foi possível concluir o sorteio, tente novamente.",
+        )
+
+    premio_id = premio_ganho["id"]
 
     # 4. Salvar o participante no banco
-    supabase.table("participantes").insert({
-        "nome": nome_cliente,
-        "whatsapp": whatsapp_cliente,
-        "acesso_id": acesso_id,
-        "premio_id": premio_id
-    }).execute()
+    supabase.table("participantes").insert(
+        {
+            "nome": dados.nome,
+            "whatsapp": dados.whatsapp,
+            "acesso_id": acesso_id,
+            "premio_id": premio_id,
+        }
+    ).execute()
 
-    # 5. Atualizar o token como utilizado e descontar o estoque
-    supabase.table("acessos_roleta").update({"utilizado": True}).eq("id", acesso_id).execute()
-    
-    novo_estoque = premio_ganho['quantidade_estoque'] - 1
-    supabase.table("premios").update({"quantidade_estoque": novo_estoque}).eq("id", premio_id).execute()
+    # 5. Descobrir em qual posição da roleta (1 a 12) esse prêmio fica,
+    # pra mandar isso pro front-end em vez de fazer ele "adivinhar"
+    # comparando textos.
+    #
+    # ATENÇÃO: isso assume que a ordem dos prêmios na tabela "premios"
+    # (por id, do menor pro maior) é a MESMA ordem das 12 fatias
+    # cadastradas no JavaScript da roleta. Veja o guia de implementação
+    # pra conferir/ajustar isso.
+    todos_premios = supabase.table("premios").select("id").order("id").execute()
+    ids_em_ordem = [p["id"] for p in todos_premios.data]
+    indice_roleta = (
+        ids_em_ordem.index(premio_id) + 1 if premio_id in ids_em_ordem else 1
+    )
 
-    # Retorna o resultado para a Roleta parar na fatia exata
     return {
-        "status": "sucesso", 
-        "mensagem": f"Parabéns {nome_cliente}, você ganhou: {premio_ganho['nome']}!",
-        "premio": premio_ganho['nome']
+        "status": "sucesso",
+        "mensagem": f"Parabéns {dados.nome}, você ganhou: {premio_ganho['nome']}!",
+        "premio": premio_ganho["nome"],
+        "indice_roleta": indice_roleta,
     }
