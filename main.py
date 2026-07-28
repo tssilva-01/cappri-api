@@ -1,6 +1,7 @@
 import os
 import re
 import random
+import secrets
 from collections import defaultdict
 from time import time
 
@@ -121,6 +122,40 @@ def ping():
     # confirma que o servidor está de pé. Existe só pra ser chamado
     # periodicamente e evitar que a hospedagem gratuita "durma".
     return {"status": "acordado"}
+
+
+class GerarConviteInput(BaseModel):
+    senha: str
+
+
+@app.post("/gerar-convite")
+def gerar_convite(dados: GerarConviteInput, request: Request):
+    # Reaproveita o mesmo limite de tentativas do sorteio — aqui ele
+    # serve pra impedir que alguém fique tentando adivinhar a senha
+    # repetidamente em pouco tempo.
+    verificar_limite_de_tentativas(request)
+
+    senha_correta = os.environ.get("SENHA_FUNCIONARIA")
+    if not senha_correta:
+        raise HTTPException(
+            status_code=500,
+            detail="Senha da equipe não configurada no servidor.",
+        )
+    if dados.senha != senha_correta:
+        raise HTTPException(status_code=401, detail="Senha incorreta.")
+
+    # Token curto, mas com bastante aleatoriedade — não dá pra adivinhar
+    # tentando números em sequência.
+    novo_token = secrets.token_urlsafe(6)
+
+    supabase.table("acessos_roleta").insert(
+        {
+            "token": novo_token,
+            "utilizado": False,
+        }
+    ).execute()
+
+    return {"token": novo_token}
 
 
 @app.get("/premios")
