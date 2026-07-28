@@ -217,14 +217,27 @@ def sortear_premio(token: str, dados: ParticipanteInput, request: Request):
     premio_id = premio_ganho["id"]
 
     # 4. Salvar o participante no banco
-    supabase.table("participantes").insert(
-        {
-            "nome": dados.nome,
-            "whatsapp": dados.whatsapp,
-            "acesso_id": acesso_id,
-            "premio_id": premio_id,
-        }
-    ).execute()
+    participante_inserido = (
+        supabase.table("participantes")
+        .insert(
+            {
+                "nome": dados.nome,
+                "whatsapp": dados.whatsapp,
+                "acesso_id": acesso_id,
+                "premio_id": premio_id,
+            }
+        )
+        .execute()
+    )
+
+    # Código de conferência do voucher: é o próprio ID salvo na tabela
+    # "participantes", formatado de forma mais apresentável. A loja pode
+    # conferir esse número diretamente na tabela do Supabase (coluna
+    # "id") pra confirmar que o voucher é legítimo.
+    participante_id = (
+        participante_inserido.data[0]["id"] if participante_inserido.data else None
+    )
+    codigo_voucher = f"CPR-{participante_id:06d}" if participante_id else "CPR-000000"
 
     # 5. Descobrir em qual posição da roleta (1 a 12) esse prêmio fica,
     # pra mandar isso pro front-end em vez de fazer ele "adivinhar"
@@ -245,4 +258,5 @@ def sortear_premio(token: str, dados: ParticipanteInput, request: Request):
         "mensagem": f"Parabéns {dados.nome}, você ganhou: {premio_ganho['nome']}!",
         "premio": premio_ganho["nome"],
         "indice_roleta": indice_roleta,
+        "codigo_voucher": codigo_voucher,
     }
