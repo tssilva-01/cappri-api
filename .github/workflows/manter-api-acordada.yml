@@ -1,0 +1,16 @@
+name: Manter API acordada
+
+on:
+  schedule:
+    # A cada 10 minutos. O Render "dorme" depois de 15 minutos sem uso,
+    # então isso deixa uma margem de segurança confortável.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # permite rodar manualmente pelo botão "Run workflow"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chamar a API pra mantê-la acordada
+        run: |
+          curl -sS --max-time 30 https://cappri.onrender.com/ping || echo "Ping não respondeu dessa vez — sem problema, tentamos de novo em 10 minutos."
