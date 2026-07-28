@@ -115,6 +115,14 @@ def verificar_limite_de_tentativas(request: Request):
 # =========================================================
 # ROTAS
 # =========================================================
+@app.get("/ping")
+def ping():
+    # Endpoint propositalmente simples: não consulta o Supabase, só
+    # confirma que o servidor está de pé. Existe só pra ser chamado
+    # periodicamente e evitar que a hospedagem gratuita "durma".
+    return {"status": "acordado"}
+
+
 @app.get("/premios")
 def listar_premios():
     resposta = supabase.table("premios").select("*").execute()
