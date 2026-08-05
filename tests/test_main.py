@@ -1,0 +1,285 @@
+import os
+from collections import deque
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
+os.environ.setdefault("SUPABASE_KEY", "test-key")
+os.environ.setdefault("SENHA_FUNCIONARIA", "test-password")
+
+import main  # noqa: E402
+
+
+@dataclass
+class FakeResponse:
+    data: list[dict[str, Any]]
+
+
+class FakeQuery:
+    def __init__(self, database: "FakeDatabase", source: str) -> None:
+        self.database = database
+        self.call: dict[str, Any] = {"source": source, "filters": []}
+
+    def select(self, columns: str) -> "FakeQuery":
+        self.call.update(action="select", columns=columns)
+        return self
+
+    def insert(self, payload: dict[str, Any]) -> "FakeQuery":
+        self.call.update(action="insert", payload=payload)
+        return self
+
+    def eq(self, column: str, value: Any) -> "FakeQuery":
+        self.call["filters"].append(("eq", column, value))
+        return self
+
+    def order(self, column: str) -> "FakeQuery":
+        self.call["order"] = column
+        return self
+
+    def limit(self, value: int) -> "FakeQuery":
+        self.call["limit"] = value
+        return self
+
+    def execute(self) -> FakeResponse:
+        self.database.calls.append(self.call)
+        if not self.database.responses:
+            raise AssertionError("O teste não preparou uma resposta para esta consulta.")
+        response = self.database.responses.popleft()
+        if isinstance(response, Exception):
+            raise response
+        return FakeResponse(response)
+
+
+class FakeDatabase:
+    def __init__(self, *responses: list[dict[str, Any]] | Exception) -> None:
+        self.responses = deque(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def table(self, name: str) -> FakeQuery:
+        return FakeQuery(self, f"table:{name}")
+
+    def rpc(self, name: str, params: dict[str, Any]) -> FakeQuery:
+        query = FakeQuery(self, f"rpc:{name}")
+        query.call.update(action="rpc", params=params)
+        return query
+
+
+@pytest.fixture
+def settings() -> main.Settings:
+    return main.Settings(
+        supabase_url="https://example.supabase.co",
+        supabase_key="test-key",
+        senha_funcionaria="test-password",
+    )
+
+
+def client_for(settings: main.Settings, database: FakeDatabase) -> TestClient:
+    return TestClient(main.create_app(settings=settings, database=database))
+
+
+def test_ping_nao_consulta_banco(settings: main.Settings) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).get("/ping")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "acordado"}
+    assert database.calls == []
+
+
+def test_cors_aceita_apenas_origem_oficial(settings: main.Settings) -> None:
+    client = client_for(settings, FakeDatabase())
+    response = client.options(
+        "/sortear/abcdefgh",
+        headers={
+            "Origin": main.ORIGEM_OFICIAL,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == main.ORIGEM_OFICIAL
+    assert "access-control-allow-credentials" not in response.headers
+
+    blocked = client.options(
+        "/sortear/abcdefgh",
+        headers={
+            "Origin": "https://site-nao-autorizado.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert "access-control-allow-origin" not in blocked.headers
+
+
+def test_gerar_convite_rejeita_senha_incorreta_sem_consultar_banco(
+    settings: main.Settings,
+) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/gerar-convite", json={"senha": "errada"}
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Senha incorreta."}
+    assert database.calls == []
+
+
+def test_gerar_convite_salva_token_seguro(settings: main.Settings) -> None:
+    database = FakeDatabase([{"id": 70}])
+    response = client_for(settings, database).post(
+        "/gerar-convite", json={"senha": "test-password"}
+    )
+
+    assert response.status_code == 200
+    token = response.json()["token"]
+    assert main.TOKEN_PATTERN.fullmatch(token)
+    assert database.calls[0]["source"] == "table:acessos_roleta"
+    assert database.calls[0]["payload"] == {"token": token, "utilizado": False}
+
+
+def test_limite_de_senha_e_separado_por_rota(settings: main.Settings) -> None:
+    database = FakeDatabase([{"utilizado": False}])
+    client = client_for(settings, database)
+
+    for _ in range(5):
+        assert client.post("/gerar-convite", json={"senha": "errada"}).status_code == 401
+
+    blocked = client.post("/gerar-convite", json={"senha": "errada"})
+    assert blocked.status_code == 429
+
+    # As tentativas de senha não devem bloquear a conferência de um convite.
+    verificar = client.get("/verificar-token/abcdefgh")
+    assert verificar.status_code == 200
+    assert verificar.json() == {"valido": True}
+
+
+def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).get("/verificar-token/curto")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Token não existe!"}
+    assert database.calls == []
+
+
+@pytest.mark.parametrize(
+    ("database_result", "expected"),
+    [
+        ([], {"valido": False, "mensagem": "Token não existe!"}),
+        ([{"utilizado": True}], {"valido": False, "mensagem": "Esse link já foi utilizado!"}),
+        ([{"utilizado": False}], {"valido": True}),
+    ],
+)
+def test_verificar_token(
+    settings: main.Settings,
+    database_result: list[dict[str, Any]],
+    expected: dict[str, Any],
+) -> None:
+    database = FakeDatabase(database_result)
+    response = client_for(settings, database).get("/verificar-token/abcdefgh")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert database.calls[0]["columns"] == "utilizado"
+    assert database.calls[0]["limit"] == 1
+
+
+def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) -> None:
+    premios_publicos = [{"id": 1, "nome": "Brinde"}]
+    database = FakeDatabase(premios_publicos)
+    response = client_for(settings, database).get("/premios")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "sucesso", "dados": premios_publicos}
+    assert database.calls[0]["columns"] == "id,nome"
+
+
+def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) -> None:
+    database = FakeDatabase(
+        [
+            {
+                "resultado": "sucesso",
+                "mensagem": "Parabéns Ana Silva, você ganhou: Brinde!",
+                "premio": "Brinde",
+                "indice_roleta": 3,
+                "participante_id": 42,
+            }
+        ]
+    )
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={"nome": "  Ana   Silva  ", "whatsapp": "(11) 99999-9999"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "sucesso",
+        "mensagem": "Parabéns Ana Silva, você ganhou: Brinde!",
+        "premio": "Brinde",
+        "indice_roleta": 3,
+        "codigo_voucher": "CPR-000042",
+    }
+    assert len(database.calls) == 1
+    assert database.calls[0] == {
+        "source": "rpc:sortear_premio_atomico",
+        "filters": [],
+        "action": "rpc",
+        "params": {
+            "p_token": "abcdefgh",
+            "p_nome": "Ana Silva",
+            "p_whatsapp": "11999999999",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("codigo", "status_code", "detail"),
+    [
+        ("token_invalido", 404, "Token não existe!"),
+        ("token_utilizado", 409, "Esse link já foi utilizado!"),
+        ("sem_premios", 409, "Acabaram os prêmios no estoque!"),
+    ],
+)
+def test_sortear_traduz_resultados_conhecidos(
+    settings: main.Settings, codigo: str, status_code: int, detail: str
+) -> None:
+    database = FakeDatabase([{"resultado": codigo}])
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={"nome": "Ana", "whatsapp": "11999999999"},
+    )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+
+
+def test_validacao_impede_rpc_com_dados_invalidos(settings: main.Settings) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={"nome": "A", "whatsapp": "123"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Digite um nome válido."}
+    assert database.calls == []
+
+
+def test_falha_do_banco_retorna_erro_generico(settings: main.Settings) -> None:
+    database = FakeDatabase(RuntimeError("segredo interno do banco"))
+    response = client_for(settings, database).get("/premios")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": main.MENSAGEM_BANCO_INDISPONIVEL}
+    assert "segredo interno" not in response.text
+
+
+def test_configuracao_exige_todas_as_variaveis(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="SUPABASE_KEY"):
+        main.Settings.from_env()
