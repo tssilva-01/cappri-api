@@ -12,7 +12,7 @@ import secrets
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from threading import Lock
 from time import monotonic
@@ -85,7 +85,9 @@ class Settings:
 class ParticipanteInput(BaseModel):
     nome: str
     whatsapp: str
-    consentimento: bool
+    ciencia_privacidade: bool
+    data_nascimento: date | None = None
+    consentimento_aniversario: bool = False
 
     @field_validator("nome")
     @classmethod
@@ -105,12 +107,36 @@ class ParticipanteInput(BaseModel):
             )
         return somente_numeros
 
-    @field_validator("consentimento")
+    @field_validator("ciencia_privacidade")
     @classmethod
-    def validar_consentimento(cls, valor: bool) -> bool:
+    def validar_ciencia_privacidade(cls, valor: bool) -> bool:
         if valor is not True:
-            raise ValueError("Você precisa aceitar o contato para participar.")
+            raise ValueError(
+                "Você precisa confirmar que leu o Aviso de Privacidade."
+            )
         return valor
+
+    @model_validator(mode="after")
+    def validar_programa_aniversario(self) -> "ParticipanteInput":
+        if self.consentimento_aniversario and self.data_nascimento is None:
+            raise ValueError(
+                "Informe a data de nascimento para autorizar a mensagem de aniversário."
+            )
+        if self.data_nascimento is not None and not self.consentimento_aniversario:
+            raise ValueError(
+                "Marque a autorização de aniversário para enviar a data de nascimento."
+            )
+        if self.data_nascimento is not None:
+            hoje = date.today()
+            idade = hoje.year - self.data_nascimento.year - (
+                (hoje.month, hoje.day)
+                < (self.data_nascimento.month, self.data_nascimento.day)
+            )
+            if idade < 18:
+                raise ValueError(
+                    "O cadastro de aniversário está disponível apenas para maiores de 18 anos."
+                )
+        return self
 
 
 class GerarConviteInput(BaseModel):
@@ -438,6 +464,9 @@ def create_app(
                 "id": primeiro["campanha_id"],
                 "nome": primeiro["campanha_nome"],
                 "texto_consentimento": primeiro.get("texto_consentimento"),
+                "politica_privacidade_versao": primeiro.get(
+                    "politica_privacidade_versao"
+                ),
             },
             "dados": premios,
         }
@@ -473,18 +502,26 @@ def create_app(
 
         resposta = executar_consulta(
             lambda: database.rpc(
-                "sortear_premio_atomico",
+                "sortear_premio_com_privacidade",
                 {
                     "p_token": token,
                     "p_nome": dados.nome,
                     "p_whatsapp": dados.whatsapp,
-                    "p_consentimento": dados.consentimento,
+                    "p_ciencia_privacidade": dados.ciencia_privacidade,
+                    "p_data_nascimento": dados.data_nascimento.isoformat()
+                    if dados.data_nascimento
+                    else None,
+                    "p_consentimento_aniversario": (
+                        dados.consentimento_aniversario
+                    ),
                 },
             ).execute()
         )
         resultado = primeira_linha(resposta)
         if resultado is None:
-            logger.error("RPC sortear_premio_atomico não devolveu resultado")
+            logger.error(
+                "RPC sortear_premio_com_privacidade não devolveu resultado"
+            )
             raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
 
         codigo = resultado.get("resultado")
@@ -499,12 +536,16 @@ def create_app(
             status_code, detalhe = erros_conhecidos[codigo]
             raise HTTPException(status_code=status_code, detail=detalhe)
         if codigo != "sucesso":
-            logger.error("RPC sortear_premio_atomico devolveu estado desconhecido")
+            logger.error(
+                "RPC sortear_premio_com_privacidade devolveu estado desconhecido"
+            )
             raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
 
         participante_id = resultado.get("participante_id")
         if not isinstance(participante_id, int) or participante_id <= 0:
-            logger.error("RPC sortear_premio_atomico devolveu participante inválido")
+            logger.error(
+                "RPC sortear_premio_com_privacidade devolveu participante inválido"
+            )
             raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
 
         return {
@@ -670,6 +711,23 @@ def create_app(
             {"nao_encontrado": "Participante não encontrada."},
         )
 
+    @api.patch("/admin/participantes/{participante_id}/revogar-aniversario")
+    def revogar_aniversario_admin(
+        participante_id: int, request: Request
+    ) -> dict[str, Any]:
+        exigir_admin(request)
+        return executar_rpc_admin(
+            "revogar_consentimento_aniversario_admin",
+            {"p_participante_id": participante_id},
+            {
+                "nao_encontrado": "Participante não encontrada.",
+                "nao_autorizado": (
+                    "Esta participante não autorizou mensagens de aniversário."
+                ),
+                "ja_revogado": "A autorização de aniversário já foi revogada.",
+            },
+        )
+
     @api.get("/admin/participantes.csv")
     def exportar_participantes_csv(
         request: Request, campanha_id: int
@@ -693,6 +751,11 @@ def create_app(
                 "Nome",
                 "WhatsApp",
                 "Prêmio",
+                "Data de nascimento",
+                "Autorização de aniversário em",
+                "Autorização de aniversário revogada em",
+                "Versão da política",
+                "Ciência do aviso de privacidade em",
                 "Participação",
                 "Resgatado em",
                 "Observação",
@@ -705,6 +768,17 @@ def create_app(
                     proteger_celula_csv(linha.get("nome")),
                     proteger_celula_csv(linha.get("whatsapp")),
                     proteger_celula_csv(linha.get("premio")),
+                    proteger_celula_csv(linha.get("data_nascimento")),
+                    proteger_celula_csv(
+                        linha.get("consentimento_aniversario_em")
+                    ),
+                    proteger_celula_csv(
+                        linha.get("consentimento_aniversario_revogado_em")
+                    ),
+                    proteger_celula_csv(
+                        linha.get("politica_privacidade_versao")
+                    ),
+                    proteger_celula_csv(linha.get("ciencia_privacidade_em")),
                     proteger_celula_csv(linha.get("data_participacao")),
                     proteger_celula_csv(linha.get("resgatado_em")),
                     proteger_celula_csv(linha.get("observacao_resgate")),
