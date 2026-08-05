@@ -129,20 +129,42 @@ def test_gerar_convite_rejeita_senha_incorreta_sem_consultar_banco(
 
 
 def test_gerar_convite_salva_token_seguro(settings: main.Settings) -> None:
-    database = FakeDatabase([{"id": 70}])
+    database = FakeDatabase(
+        [
+            {
+                "resultado": "sucesso",
+                "token_gerado": "token-devolvido",
+                "campanha": "Campanha de testes",
+            }
+        ]
+    )
     response = client_for(settings, database).post(
         "/gerar-convite", json={"senha": "test-password"}
     )
 
     assert response.status_code == 200
-    token = response.json()["token"]
-    assert main.TOKEN_PATTERN.fullmatch(token)
-    assert database.calls[0]["source"] == "table:acessos_roleta"
-    assert database.calls[0]["payload"] == {"token": token, "utilizado": False}
+    assert response.json() == {
+        "token": "token-devolvido",
+        "campanha": "Campanha de testes",
+    }
+    assert database.calls[0]["source"] == "rpc:gerar_convite_roleta"
+    token_enviado = database.calls[0]["params"]["p_token"]
+    assert main.TOKEN_PATTERN.fullmatch(token_enviado)
+    assert len(token_enviado) == 16
+
+
+def test_gerar_convite_exige_campanha_ativa(settings: main.Settings) -> None:
+    database = FakeDatabase([{"resultado": "sem_campanha"}])
+    response = client_for(settings, database).post(
+        "/gerar-convite", json={"senha": "test-password"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Não existe uma campanha ativa."}
 
 
 def test_limite_de_senha_e_separado_por_rota(settings: main.Settings) -> None:
-    database = FakeDatabase([{"utilizado": False}])
+    database = FakeDatabase([{"valido": True, "mensagem": None, "campanha": "Teste"}])
     client = client_for(settings, database)
 
     for _ in range(5):
@@ -154,7 +176,7 @@ def test_limite_de_senha_e_separado_por_rota(settings: main.Settings) -> None:
     # As tentativas de senha não devem bloquear a conferência de um convite.
     verificar = client.get("/verificar-token/abcdefgh")
     assert verificar.status_code == 200
-    assert verificar.json() == {"valido": True}
+    assert verificar.json() == {"valido": True, "campanha": "Teste"}
 
 
 def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) -> None:
@@ -169,9 +191,28 @@ def test_verificar_token_invalido_nao_consulta_banco(settings: main.Settings) ->
 @pytest.mark.parametrize(
     ("database_result", "expected"),
     [
-        ([], {"valido": False, "mensagem": "Token não existe!"}),
-        ([{"utilizado": True}], {"valido": False, "mensagem": "Esse link já foi utilizado!"}),
-        ([{"utilizado": False}], {"valido": True}),
+        (
+            [{"valido": False, "mensagem": "Token não existe!", "campanha": None}],
+            {"valido": False, "mensagem": "Token não existe!"},
+        ),
+        (
+            [
+                {
+                    "valido": False,
+                    "mensagem": "Esse link já foi utilizado!",
+                    "campanha": "Teste",
+                }
+            ],
+            {
+                "valido": False,
+                "mensagem": "Esse link já foi utilizado!",
+                "campanha": "Teste",
+            },
+        ),
+        (
+            [{"valido": True, "mensagem": None, "campanha": "Teste"}],
+            {"valido": True, "campanha": "Teste"},
+        ),
     ],
 )
 def test_verificar_token(
@@ -184,18 +225,47 @@ def test_verificar_token(
 
     assert response.status_code == 200
     assert response.json() == expected
-    assert database.calls[0]["columns"] == "utilizado"
-    assert database.calls[0]["limit"] == 1
+    assert database.calls[0] == {
+        "source": "rpc:verificar_token_roleta",
+        "filters": [],
+        "action": "rpc",
+        "params": {"p_token": "abcdefgh"},
+    }
 
 
 def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) -> None:
-    premios_publicos = [{"id": 1, "nome": "Brinde"}]
-    database = FakeDatabase(premios_publicos)
+    database = FakeDatabase(
+        [
+            {
+                "resultado": "sucesso",
+                "mensagem": None,
+                "campanha_id": 1,
+                "campanha_nome": "Campanha de testes",
+                "premio_id": 7,
+                "premio_nome": "Brinde",
+                "posicao_roleta": 2,
+            }
+        ]
+    )
     response = client_for(settings, database).get("/premios")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "sucesso", "dados": premios_publicos}
-    assert database.calls[0]["columns"] == "id,nome"
+    assert response.json() == {
+        "status": "sucesso",
+        "campanha": {"id": 1, "nome": "Campanha de testes"},
+        "dados": [{"id": 7, "nome": "Brinde", "posicao_roleta": 2}],
+    }
+    assert "estoque_disponivel" not in response.text
+    assert "peso_sorteio" not in response.text
+    assert database.calls[0]["source"] == "rpc:listar_premios_roleta"
+
+
+def test_premios_exige_campanha_ativa(settings: main.Settings) -> None:
+    database = FakeDatabase([{"resultado": "sem_campanha"}])
+    response = client_for(settings, database).get("/premios")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Não existe uma campanha ativa."}
 
 
 def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) -> None:
@@ -212,7 +282,11 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
     )
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "  Ana   Silva  ", "whatsapp": "(11) 99999-9999"},
+        json={
+            "nome": "  Ana   Silva  ",
+            "whatsapp": "(11) 99999-9999",
+            "consentimento": True,
+        },
     )
 
     assert response.status_code == 200
@@ -232,6 +306,7 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
             "p_token": "abcdefgh",
             "p_nome": "Ana Silva",
             "p_whatsapp": "11999999999",
+            "p_consentimento": True,
         },
     }
 
@@ -241,6 +316,7 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
     [
         ("token_invalido", 404, "Token não existe!"),
         ("token_utilizado", 409, "Esse link já foi utilizado!"),
+        ("campanha_inativa", 409, "Esta campanha não está ativa."),
         ("sem_premios", 409, "Acabaram os prêmios no estoque!"),
     ],
 )
@@ -250,7 +326,7 @@ def test_sortear_traduz_resultados_conhecidos(
     database = FakeDatabase([{"resultado": codigo}])
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "Ana", "whatsapp": "11999999999"},
+        json={"nome": "Ana", "whatsapp": "11999999999", "consentimento": True},
     )
 
     assert response.status_code == status_code
@@ -261,11 +337,25 @@ def test_validacao_impede_rpc_com_dados_invalidos(settings: main.Settings) -> No
     database = FakeDatabase()
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "A", "whatsapp": "123"},
+        json={"nome": "A", "whatsapp": "123", "consentimento": True},
     )
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Digite um nome válido."}
+    assert database.calls == []
+
+
+def test_validacao_exige_consentimento(settings: main.Settings) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={"nome": "Ana", "whatsapp": "11999999999", "consentimento": False},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Você precisa aceitar o contato para participar."
+    }
     assert database.calls == []
 
 
