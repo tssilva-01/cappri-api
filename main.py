@@ -67,6 +67,7 @@ class Settings:
 class ParticipanteInput(BaseModel):
     nome: str
     whatsapp: str
+    consentimento: bool
 
     @field_validator("nome")
     @classmethod
@@ -86,6 +87,13 @@ class ParticipanteInput(BaseModel):
                 "WhatsApp inválido. Use o formato (DD) 9XXXX-XXXX, com DDD."
             )
         return somente_numeros
+
+    @field_validator("consentimento")
+    @classmethod
+    def validar_consentimento(cls, valor: bool) -> bool:
+        if valor is not True:
+            raise ValueError("Você precisa aceitar o contato para participar.")
+        return valor
 
 
 class GerarConviteInput(BaseModel):
@@ -153,7 +161,7 @@ def create_app(
     settings = settings or Settings.from_env()
     database = database or create_client(settings.supabase_url, settings.supabase_key)
 
-    api = FastAPI(title="Cappri API", version="2.0.0")
+    api = FastAPI(title="Cappri API", version="3.0.0")
     api.state.settings = settings
     api.state.database = database
     api.state.rate_limiter = InMemoryRateLimiter()
@@ -189,23 +197,63 @@ def create_app(
         if not secrets.compare_digest(senha_enviada, senha_correta):
             raise HTTPException(status_code=401, detail="Senha incorreta.")
 
-        novo_token = secrets.token_urlsafe(6)
-        executar_consulta(
-            lambda: database.table("acessos_roleta")
-            .insert({"token": novo_token, "utilizado": False})
-            .execute()
+        novo_token = secrets.token_urlsafe(12)
+        resposta = executar_consulta(
+            lambda: database.rpc(
+                "gerar_convite_roleta", {"p_token": novo_token}
+            ).execute()
         )
-        return {"token": novo_token}
+        resultado = primeira_linha(resposta)
+        if resultado is None:
+            logger.error("RPC gerar_convite_roleta não devolveu resultado")
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+        if resultado.get("resultado") == "sem_campanha":
+            raise HTTPException(status_code=409, detail="Não existe uma campanha ativa.")
+        if resultado.get("resultado") != "sucesso":
+            logger.error("RPC gerar_convite_roleta devolveu estado desconhecido")
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+
+        return {
+            "token": resultado["token_gerado"],
+            "campanha": resultado["campanha"],
+        }
 
     @api.get("/premios")
     def listar_premios() -> dict[str, Any]:
         resposta = executar_consulta(
-            lambda: database.table("premios")
-            .select("id,nome")
-            .order("id")
-            .execute()
+            lambda: database.rpc("listar_premios_roleta", {}).execute()
         )
-        return {"status": "sucesso", "dados": resposta.data}
+        linhas = getattr(resposta, "data", None)
+        if not linhas:
+            logger.error("RPC listar_premios_roleta não devolveu resultado")
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+
+        primeiro = linhas[0]
+        if primeiro.get("resultado") == "sem_campanha":
+            raise HTTPException(status_code=409, detail="Não existe uma campanha ativa.")
+        if primeiro.get("resultado") == "sem_premios":
+            raise HTTPException(status_code=409, detail="A campanha não possui prêmios.")
+        if primeiro.get("resultado") != "sucesso":
+            logger.error("RPC listar_premios_roleta devolveu estado desconhecido")
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+
+        premios = [
+            {
+                "id": linha["premio_id"],
+                "nome": linha["premio_nome"],
+                "posicao_roleta": linha["posicao_roleta"],
+            }
+            for linha in linhas
+            if linha.get("premio_id") is not None
+        ]
+        return {
+            "status": "sucesso",
+            "campanha": {
+                "id": primeiro["campanha_id"],
+                "nome": primeiro["campanha_nome"],
+            },
+            "dados": premios,
+        }
 
     @api.get("/verificar-token/{token}")
     def verificar_token(token: str, request: Request) -> dict[str, Any]:
@@ -213,18 +261,21 @@ def create_app(
         api.state.rate_limiter.verificar(request, "verificar-token", limite=20)
 
         resposta = executar_consulta(
-            lambda: database.table("acessos_roleta")
-            .select("utilizado")
-            .eq("token", token)
-            .limit(1)
-            .execute()
+            lambda: database.rpc(
+                "verificar_token_roleta", {"p_token": token}
+            ).execute()
         )
-        acesso = primeira_linha(resposta)
-        if acesso is None:
-            return {"valido": False, "mensagem": "Token não existe!"}
-        if acesso["utilizado"]:
-            return {"valido": False, "mensagem": "Esse link já foi utilizado!"}
-        return {"valido": True}
+        resultado = primeira_linha(resposta)
+        if resultado is None or not isinstance(resultado.get("valido"), bool):
+            logger.error("RPC verificar_token_roleta não devolveu resultado válido")
+            raise HTTPException(status_code=503, detail=MENSAGEM_BANCO_INDISPONIVEL)
+
+        retorno: dict[str, Any] = {"valido": resultado["valido"]}
+        if resultado.get("mensagem"):
+            retorno["mensagem"] = resultado["mensagem"]
+        if resultado.get("campanha"):
+            retorno["campanha"] = resultado["campanha"]
+        return retorno
 
     @api.post("/sortear/{token}")
     def sortear_premio(
@@ -241,6 +292,7 @@ def create_app(
                     "p_token": token,
                     "p_nome": dados.nome,
                     "p_whatsapp": dados.whatsapp,
+                    "p_consentimento": dados.consentimento,
                 },
             ).execute()
         )
@@ -253,6 +305,7 @@ def create_app(
         erros_conhecidos = {
             "token_invalido": (404, "Token não existe!"),
             "token_utilizado": (409, "Esse link já foi utilizado!"),
+            "campanha_inativa": (409, "Esta campanha não está ativa."),
             "sem_premios": (409, "Acabaram os prêmios no estoque!"),
         }
         if codigo in erros_conhecidos:
