@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "test-key")
 os.environ.setdefault("SENHA_FUNCIONARIA", "test-password")
+os.environ.setdefault("SENHA_ADMIN", "admin-test-password")
+os.environ.setdefault("ADMIN_SESSION_SECRET", "a" * 64)
 
 import main  # noqa: E402
 
@@ -74,6 +76,8 @@ def settings() -> main.Settings:
         supabase_url="https://example.supabase.co",
         supabase_key="test-key",
         senha_funcionaria="test-password",
+        senha_admin="admin-test-password",
+        admin_session_secret="a" * 64,
     )
 
 
@@ -97,12 +101,13 @@ def test_cors_aceita_apenas_origem_oficial(settings: main.Settings) -> None:
         headers={
             "Origin": main.ORIGEM_OFICIAL,
             "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "content-type",
+            "Access-Control-Request-Headers": "authorization,content-type",
         },
     )
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == main.ORIGEM_OFICIAL
+    assert "authorization" in response.headers["access-control-allow-headers"].lower()
     assert "access-control-allow-credentials" not in response.headers
 
     blocked = client.options(
@@ -241,6 +246,7 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
                 "mensagem": None,
                 "campanha_id": 1,
                 "campanha_nome": "Campanha de testes",
+                "texto_consentimento": "Aceito receber contato sobre a campanha.",
                 "premio_id": 7,
                 "premio_nome": "Brinde",
                 "posicao_roleta": 2,
@@ -252,7 +258,11 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
     assert response.status_code == 200
     assert response.json() == {
         "status": "sucesso",
-        "campanha": {"id": 1, "nome": "Campanha de testes"},
+        "campanha": {
+            "id": 1,
+            "nome": "Campanha de testes",
+            "texto_consentimento": "Aceito receber contato sobre a campanha.",
+        },
         "dados": [{"id": 7, "nome": "Brinde", "posicao_roleta": 2}],
     }
     assert "estoque_disponivel" not in response.text
@@ -316,6 +326,7 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
     [
         ("token_invalido", 404, "Token não existe!"),
         ("token_utilizado", 409, "Esse link já foi utilizado!"),
+        ("token_cancelado", 409, "Este convite foi cancelado."),
         ("campanha_inativa", 409, "Esta campanha não está ativa."),
         ("sem_premios", 409, "Acabaram os prêmios no estoque!"),
     ],
@@ -373,3 +384,156 @@ def test_configuracao_exige_todas_as_variaveis(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(RuntimeError, match="SUPABASE_KEY"):
         main.Settings.from_env()
+
+
+def cabecalho_admin(settings: main.Settings) -> dict[str, str]:
+    token, _ = main.criar_sessao_admin(settings, agora=1_800_000_000)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_login_admin_cria_sessao_sem_consultar_banco(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_000)
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/admin/login", json={"senha": "admin-test-password"}
+    )
+
+    assert response.status_code == 200
+    corpo = response.json()
+    assert corpo["duracao_segundos"] == settings.admin_session_seconds
+    assert main.validar_sessao_admin(
+        corpo["token"], settings, agora=1_800_000_001
+    )
+    assert database.calls == []
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_login_admin_rejeita_senha_incorreta(settings: main.Settings) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/admin/login", json={"senha": "senha-errada"}
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Senha administrativa incorreta."}
+    assert database.calls == []
+
+
+def test_sessao_admin_rejeita_token_adulterado(settings: main.Settings) -> None:
+    token, _ = main.criar_sessao_admin(settings)
+    token_adulterado = token[:-1] + ("A" if token[-1] != "A" else "B")
+    response = client_for(settings, FakeDatabase()).get(
+        "/admin/sessao",
+        headers={"Authorization": f"Bearer {token_adulterado}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": main.MENSAGEM_SESSAO_INVALIDA}
+
+
+def test_sessao_admin_rejeita_token_malformado_sem_erro_interno(
+    settings: main.Settings,
+) -> None:
+    response = client_for(settings, FakeDatabase()).get(
+        "/admin/sessao",
+        headers={"Authorization": "Bearer %%%.%%%"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": main.MENSAGEM_SESSAO_INVALIDA}
+
+
+def test_painel_admin_exige_autenticacao_sem_consultar_banco(
+    settings: main.Settings,
+) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).get("/admin/painel")
+
+    assert response.status_code == 401
+    assert database.calls == []
+
+
+def test_painel_admin_retorna_agregados_protegidos(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    painel = {
+        "resultado": "sucesso",
+        "campanha": {"id": 1, "nome": "Campanha Cappri 2026.2"},
+        "metricas": {"participantes": 3},
+        "premios": [],
+        "participantes": [],
+        "convites": [],
+        "auditoria": [],
+    }
+    database = FakeDatabase([{"painel": painel}])
+    response = client_for(settings, database).get(
+        "/admin/painel?campanha_id=1", headers=cabecalho_admin(settings)
+    )
+
+    assert response.status_code == 200
+    assert response.json() == painel
+    assert database.calls[0] == {
+        "source": "rpc:obter_painel_admin",
+        "filters": [],
+        "action": "rpc",
+        "params": {"p_campanha_id": 1},
+    }
+
+
+def test_admin_atualiza_premio_por_rpc_atomica(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase([{"resultado": "sucesso", "premio_id": 7}])
+    response = client_for(settings, database).put(
+        "/admin/premios/7",
+        headers=cabecalho_admin(settings),
+        json={
+            "nome": "Brinde especial",
+            "estoque_disponivel": 12,
+            "peso_sorteio": "25.5",
+            "ativo": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"resultado": "sucesso", "premio_id": 7}
+    assert database.calls[0]["source"] == "rpc:atualizar_premio_admin"
+    assert database.calls[0]["params"] == {
+        "p_premio_id": 7,
+        "p_nome": "Brinde especial",
+        "p_estoque_disponivel": 12,
+        "p_peso_sorteio": "25.5",
+        "p_ativo": True,
+    }
+
+
+def test_exportacao_csv_protege_formula_e_usa_utf8(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase(
+        [
+            {
+                "codigo_voucher": "CPR-000001",
+                "nome": "=HIPERLINK(\"site\")",
+                "whatsapp": "11999999999",
+                "premio": "Óculos",
+                "data_participacao": "2026-08-05T12:00:00+00:00",
+                "resgatado_em": None,
+                "observacao_resgate": None,
+            }
+        ]
+    )
+    response = client_for(settings, database).get(
+        "/admin/participantes.csv?campanha_id=1",
+        headers=cabecalho_admin(settings),
+    )
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"\xef\xbb\xbf")
+    assert "'=HIPERLINK" in response.content.decode("utf-8-sig")
+    assert "attachment" in response.headers["content-disposition"]
