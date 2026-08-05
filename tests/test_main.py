@@ -246,7 +246,8 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
                 "mensagem": None,
                 "campanha_id": 1,
                 "campanha_nome": "Campanha de testes",
-                "texto_consentimento": "Aceito receber contato sobre a campanha.",
+                "texto_consentimento": "Li o Aviso de Privacidade da campanha.",
+                "politica_privacidade_versao": "1.0",
                 "premio_id": 7,
                 "premio_nome": "Brinde",
                 "posicao_roleta": 2,
@@ -261,7 +262,8 @@ def test_premios_nao_expoe_estoque_nem_probabilidade(settings: main.Settings) ->
         "campanha": {
             "id": 1,
             "nome": "Campanha de testes",
-            "texto_consentimento": "Aceito receber contato sobre a campanha.",
+            "texto_consentimento": "Li o Aviso de Privacidade da campanha.",
+            "politica_privacidade_versao": "1.0",
         },
         "dados": [{"id": 7, "nome": "Brinde", "posicao_roleta": 2}],
     }
@@ -295,7 +297,9 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
         json={
             "nome": "  Ana   Silva  ",
             "whatsapp": "(11) 99999-9999",
-            "consentimento": True,
+            "ciencia_privacidade": True,
+            "data_nascimento": None,
+            "consentimento_aniversario": False,
         },
     )
 
@@ -309,14 +313,16 @@ def test_sortear_normaliza_dados_e_usa_uma_unica_rpc(settings: main.Settings) ->
     }
     assert len(database.calls) == 1
     assert database.calls[0] == {
-        "source": "rpc:sortear_premio_atomico",
+        "source": "rpc:sortear_premio_com_privacidade",
         "filters": [],
         "action": "rpc",
         "params": {
             "p_token": "abcdefgh",
             "p_nome": "Ana Silva",
             "p_whatsapp": "11999999999",
-            "p_consentimento": True,
+            "p_ciencia_privacidade": True,
+            "p_data_nascimento": None,
+            "p_consentimento_aniversario": False,
         },
     }
 
@@ -337,7 +343,11 @@ def test_sortear_traduz_resultados_conhecidos(
     database = FakeDatabase([{"resultado": codigo}])
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "Ana", "whatsapp": "11999999999", "consentimento": True},
+        json={
+            "nome": "Ana",
+            "whatsapp": "11999999999",
+            "ciencia_privacidade": True,
+        },
     )
 
     assert response.status_code == status_code
@@ -348,7 +358,7 @@ def test_validacao_impede_rpc_com_dados_invalidos(settings: main.Settings) -> No
     database = FakeDatabase()
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "A", "whatsapp": "123", "consentimento": True},
+        json={"nome": "A", "whatsapp": "123", "ciencia_privacidade": True},
     )
 
     assert response.status_code == 422
@@ -356,17 +366,96 @@ def test_validacao_impede_rpc_com_dados_invalidos(settings: main.Settings) -> No
     assert database.calls == []
 
 
-def test_validacao_exige_consentimento(settings: main.Settings) -> None:
+def test_validacao_exige_ciencia_do_aviso_de_privacidade(
+    settings: main.Settings,
+) -> None:
     database = FakeDatabase()
     response = client_for(settings, database).post(
         "/sortear/abcdefgh",
-        json={"nome": "Ana", "whatsapp": "11999999999", "consentimento": False},
+        json={
+            "nome": "Ana",
+            "whatsapp": "11999999999",
+            "ciencia_privacidade": False,
+        },
     )
 
     assert response.status_code == 422
     assert response.json() == {
-        "detail": "Você precisa aceitar o contato para participar."
+        "detail": "Você precisa confirmar que leu o Aviso de Privacidade."
     }
+    assert database.calls == []
+
+
+def test_aniversario_opcional_pode_ser_autorizado_por_adulta(
+    settings: main.Settings,
+) -> None:
+    database = FakeDatabase(
+        [
+            {
+                "resultado": "sucesso",
+                "mensagem": "Parabéns Ana, você ganhou: Brinde!",
+                "premio": "Brinde",
+                "indice_roleta": 1,
+                "participante_id": 7,
+            }
+        ]
+    )
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={
+            "nome": "Ana",
+            "whatsapp": "11999999999",
+            "ciencia_privacidade": True,
+            "data_nascimento": "1990-05-20",
+            "consentimento_aniversario": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert database.calls[0]["params"]["p_data_nascimento"] == "1990-05-20"
+    assert database.calls[0]["params"]["p_consentimento_aniversario"] is True
+
+
+@pytest.mark.parametrize(
+    ("data_nascimento", "consentimento_aniversario", "detail"),
+    [
+        (
+            None,
+            True,
+            "Informe a data de nascimento para autorizar a mensagem de aniversário.",
+        ),
+        (
+            "1990-05-20",
+            False,
+            "Marque a autorização de aniversário para enviar a data de nascimento.",
+        ),
+        (
+            "2020-05-20",
+            True,
+            "O cadastro de aniversário está disponível apenas para maiores de 18 anos.",
+        ),
+    ],
+)
+def test_validacao_impede_aniversario_sem_autorizacao_valida(
+    settings: main.Settings,
+    data_nascimento: str | None,
+    consentimento_aniversario: bool,
+    detail: str,
+) -> None:
+    database = FakeDatabase()
+    response = client_for(settings, database).post(
+        "/sortear/abcdefgh",
+        json={
+            "nome": "Ana",
+            "whatsapp": "11999999999",
+            "ciencia_privacidade": True,
+            "data_nascimento": data_nascimento,
+            "consentimento_aniversario": consentimento_aniversario,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
     assert database.calls == []
 
 
@@ -511,6 +600,26 @@ def test_admin_atualiza_premio_por_rpc_atomica(
     }
 
 
+def test_admin_revoga_aniversario_por_rpc_protegida(
+    settings: main.Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main.time, "time", lambda: 1_800_000_001)
+    database = FakeDatabase([{"resultado": "sucesso", "participante_id": 9}])
+    response = client_for(settings, database).patch(
+        "/admin/participantes/9/revogar-aniversario",
+        headers=cabecalho_admin(settings),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"resultado": "sucesso", "participante_id": 9}
+    assert database.calls[0] == {
+        "source": "rpc:revogar_consentimento_aniversario_admin",
+        "filters": [],
+        "action": "rpc",
+        "params": {"p_participante_id": 9},
+    }
+
+
 def test_exportacao_csv_protege_formula_e_usa_utf8(
     settings: main.Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -522,6 +631,11 @@ def test_exportacao_csv_protege_formula_e_usa_utf8(
                 "nome": "=HIPERLINK(\"site\")",
                 "whatsapp": "11999999999",
                 "premio": "Óculos",
+                "data_nascimento": "1990-05-20",
+                "consentimento_aniversario_em": "2026-08-05T12:00:00+00:00",
+                "consentimento_aniversario_revogado_em": None,
+                "politica_privacidade_versao": "1.0",
+                "ciencia_privacidade_em": "2026-08-05T12:00:00+00:00",
                 "data_participacao": "2026-08-05T12:00:00+00:00",
                 "resgatado_em": None,
                 "observacao_resgate": None,
@@ -536,4 +650,7 @@ def test_exportacao_csv_protege_formula_e_usa_utf8(
     assert response.status_code == 200
     assert response.content.startswith(b"\xef\xbb\xbf")
     assert "'=HIPERLINK" in response.content.decode("utf-8-sig")
+    assert "Data de nascimento" in response.content.decode("utf-8-sig")
+    assert "1990-05-20" in response.content.decode("utf-8-sig")
+    assert "Versão da política" in response.content.decode("utf-8-sig")
     assert "attachment" in response.headers["content-disposition"]
