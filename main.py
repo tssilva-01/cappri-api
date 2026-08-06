@@ -28,7 +28,7 @@ from supabase import Client, create_client
 
 logger = logging.getLogger("cappri_api")
 
-ORIGEM_OFICIAL = "https://capprimodafeminina.github.io"
+ORIGEM_OFICIAL = "https://tnlabs-dev.github.io/"
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
 MENSAGEM_BANCO_INDISPONIVEL = (
     "O serviço está temporariamente indisponível. Tente novamente em instantes."
